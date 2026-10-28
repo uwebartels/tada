@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 -u
 """Bsale -> Shopify product sync. SKU (Bsale variant code) is the identifier.
 
 Commands:
@@ -15,20 +15,22 @@ import argparse
 import os
 import sys
 import time
+import re
 import requests
 import logging
 import json
 
-BSALE_URL = "https://api.bsale.io/v1"
-os.environ["BSALE_ACCESS_TOKEN"] = "tutokendeacceso"
-
+loglevel=logging.INFO
 logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)
+logger.setLevel(loglevel)
 handler = logging.StreamHandler(sys.stdout)
-handler.setLevel(logging.DEBUG)
+handler.setLevel(loglevel)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
+
+from lib import *
+from bsale import *
 
 def env(name, default=None):
     v = os.environ.get(name, default)
@@ -37,56 +39,6 @@ def env(name, default=None):
     return v
 
 
-# ---------------------------------------------------------------- Bsale
-def bsale_get(path, params=None):
-    logger.info('calling bsale_get(path='+path+',params...)')
-    r = requests.get(f"{BSALE_URL}{path}", params=params,
-                     headers={"access_token": env("BSALE_ACCESS_TOKEN")}, timeout=60)
-    r.raise_for_status()
-    return r.json()
-
-
-def bsale_stock_by_sku():
-    """Return {sku: {name, price?, quantity}} summing stock over all offices."""
-    logger.info('calling bsale_stock_by_sku()')
-    items, offset = {}, 0
-    name_cache = {}
-    while True:
-        data = bsale_get("/stocks.json", {"limit": 50, "offset": offset, "expand": "[variant]"})
-        # json.dump(data, sys.stdout, indent=4)
-        # sys.exit(0)
-        for s in data.get("items", []):
-            v = s.get("variant") or {}
-            sku=str(s["id"])
-            logstring="sku="+sku
-
-            variantsku = (v.get("code") or "").strip()
-            if variantsku: logstring=logstring+", variant.sku="+variantsku
-
-            if "href" in v: logstring=logstring+", variant.href="+v["href"]
-            if not sku:
-                logger.info(logstring)
-                continue
-            entry = items.get(sku)
-            if entry is None:
-                title = v.get("description") or sku
-                logstring=logstring+", title="+title
-                href = (v.get("product") or {}).get("href")
-                if href:
-                    logstring=logstring+",href="+href
-                    if href not in name_cache:
-                        name_cache[href] = bsale_get(href.replace(BSALE_URL, "")).get("name")
-                    pname = name_cache[href]
-                    if pname:
-                        title = pname if title in ("", "Default Title") or title == pname else f"{pname} {title}"
-                entry = items[sku] = {"title": title, "quantity": 0}
-            entry["quantity"] += int(s.get("quantity") or 0)
-            logstring=logstring+", quantity="+str(entry["quantity"])
-            logger.info(logstring)
-        if not data.get("next"):
-            break
-        offset += 50
-    return items
 
 
 # -------------------------------------------------------------- Shopify
@@ -183,7 +135,7 @@ def publish_drafts(dry_run):
 def main():
     logger.info('calling main()')
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["read-stock","create-drafts", "publish-drafts"])
+    ap.add_argument("command", choices=["read-catalog","create-drafts", "publish-drafts"])
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--include-zero-stock", action="store_true",
                     help="also create products whose Bsale stock is 0")
@@ -192,9 +144,27 @@ def main():
         create_drafts(a.dry_run, a.include_zero_stock)
     elif a.command == "publish-drafts":
         publish_drafts(a.dry_run)
-    elif a.command == "read-stock":
-        items = bsale_stock_by_sku()
-        logger.info(str(count(items))+" items in stock")
+    elif a.command == "read-catalog":
+        # data = bsale_get("/products/24223.json")
+        # json.dump(data, sys.stdout, indent=4)
+        # sys.exit(0)
+
+        # examples
+        #bsale_get_objects("offices",{"name": "La Reina"})
+        #bsale_get_objects("stocks",{"officeid": "1"})
+        #bsale_get_objects("offices",{"id": "1"})
+        bsale_get_objects("variants",{"expand": "[prices,discounts,costs,attribute_values]"})
+
+        sys.exit(0)
+
+        bsale_get_objects("coins")
+        bsale_get_objects("product_types")
+        bsale_get_objects("price_lists")
+        bsale_get_objects("products",{"expand": "[product_taxes]"})
+        bsale_get_objects("variants")
+        bsale_get_objects("offices")
+        # retrieve stock from only one office to reduce mass data download
+        bsale_get_objects("stocks",{"officeid": "1"})
 
 
 if __name__ == "__main__":
