@@ -1,31 +1,34 @@
-"""Gemeinsame Hilfsfunktionen für Bsale- und Shopify-Module."""
+"""Gemeinsame Hilfsfunktionen und zentrale Logging-Konfiguration."""
 import json
 import logging
 import os
-import time
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-_LOG_LEVELS = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARN": logging.WARNING, "WARNING": logging.WARNING, "ERROR": logging.ERROR}
+LOGGER_NAME = "bsale_shopify_import"
+logger = logging.getLogger(LOGGER_NAME)
 
 def configure_logging(level: str | None = None) -> None:
-    """Initialisiert ein einheitliches Konsolen-Logging mit Zeitstempel und Level."""
+    """Konfiguriert Konsolen-Logging. Unterstützt DEBUG, INFO, WARN/WARNING, ERROR."""
     selected = (level or os.getenv("LOG_LEVEL", "INFO")).strip().upper()
-    if selected not in _LOG_LEVELS:
-        raise ValueError(f"Ungültiges Loglevel {selected!r}; erlaubt sind DEBUG, INFO und WARN.")
-    logging.basicConfig(
-        level=_LOG_LEVELS[selected],
-        format="%(asctime)s | %(levelname)s | %(message)s",
+    if selected == "WARN":
+        selected = "WARNING"
+    valid_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+    if selected not in valid_levels:
+        raise ValueError(f"Ungültiges Loglevel {selected!r}. Erlaubt: DEBUG, INFO, WARN, ERROR.")
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        fmt="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
-    )
+    ))
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(getattr(logging, selected))
+    logger.propagate = False
 
-def log(message: str, level: str = "INFO") -> None:
-    """Schreibt eine Meldung über das zentrale Logging; WARN und WARNING sind Aliase."""
-    normalized = level.strip().upper()
-    if normalized not in _LOG_LEVELS:
-        normalized = "INFO"
-    logging.getLogger("bsale_shopify_import").log(_LOG_LEVELS[normalized], message)
+def log(message: str) -> None:
+    """Kompatibilitätshelfer: bisherige Meldungen erscheinen auf INFO."""
+    logger.info(message)
 
 def as_text(value: Any) -> str:
     if value is None: return ""

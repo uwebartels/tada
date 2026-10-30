@@ -3,7 +3,7 @@ import json
 from decimal import Decimal
 from typing import Any
 from config import (HTTP, SHOPIFY_SHOP, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET, SHOPIFY_ACCESS_TOKEN, SHOPIFY_API_VERSION, SHOPIFY_LOCATION_ID)
-from common import as_text, log
+from common import as_text, logger, log
 
 class ShopifyAdmin:
     def __init__(self):
@@ -32,8 +32,7 @@ class ShopifyAdmin:
         self.url = f"https://{SHOPIFY_SHOP}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
 
     def graphql(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
-        shopify_operation = " ".join(line.strip() for line in query.strip().splitlines() if line.strip())[:140]
-        log(f"Shopify GraphQL Anfrage: {shopify_operation}; Variablen={variables or {}}", "DEBUG")
+        logger.debug("Shopify GraphQL Request gestartet")
         shopify_response = HTTP.post(
             self.url, headers=self.headers,
             json={"query": query, "variables": variables or {}}, timeout=60,
@@ -43,7 +42,7 @@ class ShopifyAdmin:
         shopify_payload = shopify_response.json()
         if shopify_payload.get("errors"):
             raise RuntimeError(f"Shopify GraphQL errors: {json.dumps(shopify_payload['errors'], ensure_ascii=False)[:1500]}")
-        log(f"Shopify GraphQL Antwort: HTTP {shopify_response.status_code}", "DEBUG")
+        logger.debug("Shopify GraphQL Antwort erfolgreich (HTTP %s)", shopify_response.status_code)
         return shopify_payload.get("data", {})
 
     def existing_skus(self) -> set[str]:
@@ -81,6 +80,7 @@ class ShopifyAdmin:
     ) -> dict[str, Any]:
         if not bsale_variants:
             raise ValueError("Produkt ohne Varianten kann nicht importiert werden.")
+        logger.info("Erstelle Shopify-Draft für Bsale-Produkt %s", bsale_product.get("id"))
         shopify_title = as_text(bsale_product.get("name")) or as_text(bsale_product.get("description")) or f"Bsale Produkt {bsale_product.get('id')}"
         shopify_description = as_text(bsale_product.get("description"))
         shopify_options: list[str] = []
@@ -186,7 +186,7 @@ class ShopifyAdmin:
             for bsale_variant, shopify_variant in zip(bsale_variants, shopify_all_variant_results):
                 bsale_stock = bsale_stocks.get(str(bsale_variant.get("id")))
                 if bsale_stock is None:
-                    log(f"Kein Stock für Bsale-Variante {bsale_variant.get('id')} in Office {bsale_office_id}; Bestand wird nicht gesetzt.", "WARN")
+                    logger.warning("Kein Stock für Bsale-Variante %s in Office %s; Bestand wird nicht gesetzt.", bsale_variant.get("id"), bsale_office_id)
                     continue
                 shopify_inventory_item_id = (shopify_variant.get("inventoryItem") or {}).get("id")
                 if not shopify_inventory_item_id:

@@ -34,29 +34,9 @@ Die Namenssuche ist ohne Beachtung der Groß-/Kleinschreibung, ansonsten muss de
 
 Wenn keine Preisliste angegeben wird, bleibt der dynamische Fallback-Modus aktiv: erst wird eine ID aus dem Variantenlink verwendet, sonst werden aktive Preislisten geprüft. Wenn mehrere Preise gefunden werden, wird kein beliebiger Preis ausgewählt.
 
-## Logging / Loglevel
+## Preislisten effizient laden
 
-Das Programm schreibt Meldungen mit Zeitstempel und Loglevel in die Konsole. Unterstützt werden `DEBUG`, `INFO` und `WARN` (alternativ `WARNING`). Standard ist `INFO`.
-
-Über die Kommandozeile:
-
-```bash
-python bsale_shopify_import.py --office-id 123 --price-list-id 7 --log-level DEBUG
-python bsale_shopify_import.py --office-id 123 --price-list-id 7 --log-level INFO
-python bsale_shopify_import.py --office-id 123 --price-list-id 7 --log-level WARN
-```
-
-Oder über eine Umgebungsvariable:
-
-```bash
-export LOG_LEVEL=DEBUG
-```
-
-- `DEBUG`: API-Aufrufe, Parameter und Details zur Produkt-/Variantenverarbeitung.
-- `INFO`: wesentliche Schritte, ausgewählte Preisliste, Ergebnis und Berichtspfad.
-- `WARN`: nur Warnungen und Fehler.
-
-API-Zugangstoken werden nicht protokolliert. Beachte, dass DEBUG weitere API-Parameter und IDs sichtbar macht; teile Debug-Protokolle daher nur nach Prüfung.
+Die ausgewählte Preisliste wird vollständig über `price_lists/{ID}/details.json` heruntergeladen (mit Pagination) und im Speicher zwischengespeichert. Die Preise aller importierten Varianten werden anschließend lokal aus diesen geladenen Datensätzen ermittelt. Die API wird daher nicht für jede einzelne Variante erneut abgefragt. Im Fallback-Modus wird jede benötigte Preisliste ebenfalls höchstens einmal vollständig geladen.
 
 ## Voraussetzungen
 
@@ -91,3 +71,23 @@ python bsale_shopify_import.py --office-id 123 --price-list-id 7 --product-ids 1
 ```
 
 Ohne `--import` wird nur ein CSV-Bericht geschrieben. Bestehende Shopify-SKUs werden übersprungen; neue Produkte werden als `DRAFT` angelegt. Prüfe die Preislisten-ID und Währung in Bsale, bevor du den echten Import startest.
+
+## Logging und Loglevel
+
+Das Logging verwendet das Python-Logging-Modul und schreibt Zeitstempel, Loglevel und Meldung in die Konsole. Standardmäßig ist `INFO` aktiv. Unterstützt werden `DEBUG`, `INFO`, `WARN`/`WARNING`, `ERROR` und `CRITICAL`.
+
+Per Kommandozeile:
+
+```bash
+python bsale_shopify_import.py --office-id 123 --price-list-id 7 --log-level DEBUG
+python bsale_shopify_import.py --office-id 123 --price-list-name "Retail" --log-level INFO
+python bsale_shopify_import.py --office-id 123 --price-list-id 7 --log-level WARN
+```
+
+Oder über eine Umgebungsvariable (wird verwendet, wenn `--log-level` nicht gesetzt ist):
+
+```bash
+export LOG_LEVEL=DEBUG
+```
+
+`DEBUG` zeigt zusätzliche API-Aufrufe, Pagination, Cache-Verwendung und Variantendetails. `INFO` zeigt die wichtigsten Importvorgänge, geladene Preislisten und Ergebnisse. `WARN` zeigt Warnungen, etwa fehlende Preise oder Lagerbestände. Fehler werden inklusive Stacktrace protokolliert. API-Tokens werden nicht geloggt.

@@ -2,7 +2,9 @@
 import re
 from typing import Any
 from config import BSALE_API_BASE, HTTP
-from common import as_text, log, money, relation_id
+from common import as_text, logger, money, relation_id
+import json,re
+from pathlib import Path
 
 class BsaleClient:
     def __init__(self, bsale_access_token: str, bsale_price_list_id: str = "", bsale_price_list_name: str = ""):
@@ -18,15 +20,22 @@ class BsaleClient:
 
     def get(self, path_or_url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         bsale_url = path_or_url if path_or_url.startswith("http") else f"{BSALE_API_BASE}/{path_or_url.lstrip('/')}"
-        log(f"Bsale API GET {bsale_url}; Parameter={params or {}}", "DEBUG")
+        logger.debug("Bsale API GET %s params=%s", bsale_url, params or {})
         bsale_response = HTTP.get(bsale_url, headers=self.headers, params=params, timeout=45)
         if bsale_response.status_code >= 400:
             raise RuntimeError(f"Bsale HTTP {bsale_response.status_code} für {bsale_url}: {bsale_response.text[:800]}")
-        bsale_payload = bsale_response.json()
-        log(f"Bsale API Antwort: HTTP {bsale_response.status_code} für {bsale_url}", "DEBUG")
-        return bsale_payload
+        logger.debug("Bsale API Antwort: HTTP %s für %s", bsale_response.status_code, bsale_url)
+        return bsale_response.json()
 
     def list_all(self, path: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+
+        # local caching
+        cachefile="cache/"+re.sub("/",".",path)
+        if Path(cachefile).is_file():
+            logger.info("reading cache file "+cachefile)
+            with open(cachefile, 'r') as file:
+                return json.load(file)
+
         bsale_items: list[dict[str, Any]] = []
         bsale_offset = 0
         bsale_params = dict(params or {})
@@ -42,6 +51,15 @@ class BsaleClient:
             if not bsale_page_items or len(bsale_items) >= bsale_count or len(bsale_page_items) < 50:
                 break
             bsale_offset += len(bsale_page_items)
+        logger.debug("Bsale-Liste %s geladen: %s Datensätze", path, len(bsale_items))
+
+        # local caching
+        cachefile = "cache/"+re.sub("/",".",path)
+        if not Path(cachefile).is_file():
+            logger.info("writing cache file "+cachefile)
+            with open(cachefile, 'w') as file:
+                json.dump(bsale_items, file, indent=4)
+
         return bsale_items
 
     def products(self, bsale_product_ids: set[str] | None) -> list[dict[str, Any]]:
@@ -64,6 +82,19 @@ class BsaleClient:
             if relation_id(bsale_stock, "variant") == bsale_variant_id and relation_id(bsale_stock, "office") == bsale_office_id:
                 return bsale_stock
         return bsale_stock_rows[0] if bsale_stock_rows else None
+
+    def _load_price_list_details(self, bsale_price_list_id: str) -> list[dict[str, Any]]:
+        """Lädt eine komplette Preisliste genau einmal und cached sie im Speicher."""
+        if not hasattr(self, "_price_list_details_cache"):
+            self._price_list_details_cache: dict[str, list[dict[str, Any]]] = {}
+        if bsale_price_list_id not in self._price_list_details_cache:
+            logger.info("Lade vollständige Bsale-Preisliste ID %s (Details)", bsale_price_list_id)
+            details = self.list_all(f"price_lists/{bsale_price_list_id}/details.json")
+            self._price_list_details_cache[bsale_price_list_id] = details
+            logger.info("Preisliste ID %s geladen: %s Preisdatensätze", bsale_price_list_id, len(details))
+        else:
+            logger.debug("Preisliste ID %s aus Cache verwendet", bsale_price_list_id)
+        return self._price_list_details_cache[bsale_price_list_id]
 
     def _price_from_detail(self, bsale_price_detail: dict[str, Any]) -> str | None:
         # Bsale detail objects normally expose variantValue and
@@ -95,7 +126,7 @@ class BsaleClient:
         if len(matches) > 1:
             raise RuntimeError(f"Mehrere Bsale-Preislisten mit dem Namen {self.bsale_price_list_name!r}. Bitte BSALE_PRICE_LIST_ID verwenden.")
         self._resolved_price_list = matches[0]
-        log(f"Ausgewählte Bsale-Preisliste: {self._resolved_price_list.get('name')} (ID {self._resolved_price_list.get('id')})")
+        logger.info("Ausgewählte Bsale-Preisliste: %s (ID %s)", self._resolved_price_list.get("name"), self._resolved_price_list.get("id"))
         return self._resolved_price_list
 
     def variant_price(self, bsale_variant: dict[str, Any]) -> str | None:
@@ -108,16 +139,14 @@ class BsaleClient:
         bsale_variant_id = as_text(bsale_variant.get("id"))
         bsale_selected_list = self.resolve_price_list()
         if bsale_selected_list:
-            log(f"Ermittle Preis für Variante {bsale_variant_id} aus Preisliste {bsale_selected_list.get('name')} (ID {bsale_selected_list.get('id')}).", "DEBUG")
             bsale_selected_list_id = as_text(bsale_selected_list.get("id"))
-            bsale_price_data = self.get(
-                f"price_lists/{bsale_selected_list_id}/details.json",
-                {"variantid": bsale_variant_id},
-            )
-            bsale_price_items = bsale_price_data.get("items", [])
+            logger.debug("bsale_selected_list_id: "+str(bsale_selected_list_id))
+            bsale_price_items = self._load_price_list_details(bsale_selected_list_id)
             if isinstance(bsale_price_items, list):
+                logger.debug("is list")
                 for bsale_price_item in bsale_price_items:
                     if relation_id(bsale_price_item, "variant") == bsale_variant_id or as_text(bsale_price_item.get("variantId")) == bsale_variant_id:
+                        logger.debug("return: "+str(self._price_from_detail(bsale_price_item)))
                         return self._price_from_detail(bsale_price_item)
             return None
 
@@ -126,20 +155,21 @@ class BsaleClient:
         bsale_match = re.search(r"/price_lists/(\d+)/details(?:/|\.json)", bsale_prices_url) if bsale_prices_url else None
         bsale_referenced_list_id = bsale_match.group(1) if bsale_match else ""
         if bsale_referenced_list_id:
-            bsale_price_data = self.get(f"price_lists/{bsale_referenced_list_id}/details.json", {"variantid": bsale_variant_id})
-            for bsale_price_item in bsale_price_data.get("items", []):
+            bsale_price_items = self._load_price_list_details(bsale_referenced_list_id)
+            for bsale_price_item in bsale_price_items:
                 if relation_id(bsale_price_item, "variant") == bsale_variant_id or as_text(bsale_price_item.get("variantId")) == bsale_variant_id:
                     return self._price_from_detail(bsale_price_item)
             return None
 
         if self._active_price_lists_cache is None:
+            logger.info("Lade aktive Bsale-Preislisten für Fallback-Modus")
             self._active_price_lists_cache = self.list_all("price_lists.json", {"state": 0})
         bsale_candidates: list[tuple[str, str, str]] = []
         for bsale_price_list in self._active_price_lists_cache:
             bsale_list_id = as_text(bsale_price_list.get("id"))
             if not bsale_list_id: continue
-            bsale_detail_data = self.get(f"price_lists/{bsale_list_id}/details.json", {"variantid": bsale_variant_id})
-            for bsale_price_item in bsale_detail_data.get("items", []):
+            bsale_detail_items = self._load_price_list_details(bsale_list_id)
+            for bsale_price_item in bsale_detail_items:
                 bsale_item_variant_id = relation_id(bsale_price_item, "variant") or as_text(bsale_price_item.get("variantId"))
                 if bsale_item_variant_id == bsale_variant_id:
                     bsale_item_price = self._price_from_detail(bsale_price_item)
@@ -149,7 +179,7 @@ class BsaleClient:
         if len(bsale_candidates) == 1: return bsale_candidates[0][2]
         if len(bsale_candidates) > 1:
             bsale_summary = ", ".join(f"{lid} ({name or 'ohne Namen'}): {price}" for lid, name, price in bsale_candidates)
-            log(f"Mehrere aktive Bsale-Preislisten für Variante {bsale_variant_id}: {bsale_summary}. Preis bleibt leer.", "WARN")
+            logger.warning("Mehrere aktive Bsale-Preislisten für Variante %s: %s. Preis bleibt leer.", bsale_variant_id, bsale_summary)
             return None
         for bsale_price_key in ("finalPrice", "salePrice", "price"):
             bsale_variant_price = money(bsale_variant.get(bsale_price_key))
