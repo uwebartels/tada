@@ -4,6 +4,10 @@ from decimal import Decimal
 from typing import Any
 from config import (HTTP, SHOPIFY_SHOP, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET, SHOPIFY_ACCESS_TOKEN, SHOPIFY_API_VERSION, SHOPIFY_LOCATION_ID)
 from common import as_text, logger, log
+import os
+import time
+from pathlib import Path
+import uuid
 
 class ShopifyAdmin:
     def __init__(self):
@@ -12,27 +16,64 @@ class ShopifyAdmin:
         if SHOPIFY_ACCESS_TOKEN:
             shopify_token = SHOPIFY_ACCESS_TOKEN
         else:
-            if not SHOPIFY_CLIENT_ID or not SHOPIFY_CLIENT_SECRET:
-                raise RuntimeError("SHOPIFY_ACCESS_TOKEN oder SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET setzen.")
-            shopify_token_response = HTTP.post(
-                f"https://{SHOPIFY_SHOP}/admin/oauth/access_token",
-                data={
-                    "grant_type": "client_credentials",
-                    "client_id": SHOPIFY_CLIENT_ID,
-                    "client_secret": SHOPIFY_CLIENT_SECRET,
-                },
-                timeout=30,
-            )
-            if shopify_token_response.status_code >= 400:
-                raise RuntimeError(f"Shopify Token-Fehler {shopify_token_response.status_code}: {shopify_token_response.text[:800]}")
-            shopify_token = shopify_token_response.json().get("access_token", "")
-            if not shopify_token:
-                raise RuntimeError("Shopify hat keinen access_token zurückgegeben.")
+            # read cached token
+            cachefile = "cache/shopify_access_token.json"
+            shopify_token = ""
+            if Path(cachefile).is_file():
+                logger.debug("write cache shopify_token_response")
+                with open(cachefile, 'r') as file:
+                    shopify_token_response = json.load(file)
+                if "expires_in" in shopify_token_response and "access_token" in shopify_token_response:
+                    current_time = time.time()
+                    file_mod_time = os.path.getmtime(cachefile)
+                    fileage = current_time - file_mod_time
+                    if int(shopify_token_response["expires_in"] > int(fileage)):
+                        logger.debug("read cache shopify_token_response")
+                        shopify_token = shopify_token_response["access_token"]
+            else:
+                if not SHOPIFY_CLIENT_ID or not SHOPIFY_CLIENT_SECRET:
+                    raise RuntimeError("SHOPIFY_ACCESS_TOKEN oder SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET setzen.")
+                shopify_token_response = HTTP.post(
+                    f"https://{SHOPIFY_SHOP}/admin/oauth/access_token",
+                    data={
+                        "grant_type": "client_credentials",
+                        "client_id": SHOPIFY_CLIENT_ID,
+                        "client_secret": SHOPIFY_CLIENT_SECRET,
+                    },
+                    timeout=30,
+                )
+                if shopify_token_response.status_code >= 400:
+                    raise RuntimeError(f"Shopify Token-Fehler {shopify_token_response.status_code}: {shopify_token_response.text[:800]}")
+                shopify_token = shopify_token_response.json().get("access_token", "")
+                if not shopify_token:
+                    raise RuntimeError("Shopify hat keinen access_token zurückgegeben.")
+
+                # cache token response
+                if not Path(cachefile).is_file():
+                    logger.debug("write cache shopify_token_response")
+                    with open(cachefile, 'w') as file:
+                        json.dump(shopify_token_response.json(), file, indent=4)
+
+        # retrieve primary location id
+        # self.location_id = shopify.Shop.current().primary_location_id
         self.headers = {"Content-Type": "application/json", "X-Shopify-Access-Token": shopify_token}
         self.url = f"https://{SHOPIFY_SHOP}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
 
+    def _location_gid(self) -> str:
+        if not getattr(self, "_cached_location_gid", None):
+            if SHOPIFY_LOCATION_ID:
+                self._cached_location_gid = SHOPIFY_LOCATION_ID if SHOPIFY_LOCATION_ID.startswith("gid://") else "gid://shopify/Location/" + SHOPIFY_LOCATION_ID
+            else:
+                shopify_locations = self.graphql("query { locations(first: 10) { nodes { id name isActive } } }")["locations"]["nodes"]
+                shopify_locations = [l for l in shopify_locations if l.get("isActive")]
+                if not shopify_locations:
+                    raise RuntimeError("Keine aktive Shopify-Location gefunden; SHOPIFY_LOCATION_ID setzen.")
+                logger.info("SHOPIFY_LOCATION_ID nicht gesetzt; verwende Location '%s' (%s)", shopify_locations[0]["name"], shopify_locations[0]["id"])
+                self._cached_location_gid = shopify_locations[0]["id"]
+        return self._cached_location_gid
+
     def graphql(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
-        logger.debug("Shopify GraphQL Request gestartet")
+        logger.debug("Shopify GraphQL Request gestartet: "+query[0:50].split('\n', 1)[0])
         shopify_response = HTTP.post(
             self.url, headers=self.headers,
             json={"query": query, "variables": variables or {}}, timeout=60,
@@ -69,45 +110,9 @@ class ShopifyAdmin:
             shopify_cursor = shopify_page_info["endCursor"]
         return shopify_skus
 
-    def create_draft(
-        self,
-        bsale_product: dict[str, Any],
-        bsale_variants: list[dict[str, Any]],
-        bsale_prices: dict[str, str | None],
-        bsale_stocks: dict[str, dict[str, Any] | None],
-        bsale_office_id: str,
-        shopify_sync_inventory: bool,
-    ) -> dict[str, Any]:
-        if not bsale_variants:
-            raise ValueError("Produkt ohne Varianten kann nicht importiert werden.")
-        logger.info("Erstelle Shopify-Draft für Bsale-Produkt %s", bsale_product.get("id"))
-        shopify_title = as_text(bsale_product.get("name")) or as_text(bsale_product.get("description")) or f"Bsale Produkt {bsale_product.get('id')}"
-        shopify_description = as_text(bsale_product.get("description"))
-        shopify_options: list[str] = []
-        for bsale_variant in bsale_variants:
-            shopify_option = as_text(bsale_variant.get("description")) or as_text(bsale_variant.get("code")) or str(bsale_variant.get("id"))
-            if shopify_option in shopify_options:
-                shopify_option = f"{shopify_option} ({bsale_variant.get('id')})"
-            shopify_options.append(shopify_option[:255])
+    def _create_product(self, title: str, description: str, id, options: list, metafields: dict):
+        logger.debug("calling _create_product()")
 
-        shopify_product_input = {
-            "title": shopify_title[:255],
-            "descriptionHtml": "<p>" + (shopify_description.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")) + "</p>" if shopify_description else "",
-            "vendor": "Bsale",
-            "status": "DRAFT",
-            "tags": ["bsale", f"bsale-product-{bsale_product.get('id')}"],
-            "productOptions": [{
-                "name": "Bsale variant",
-                "values": [{"name": shopify_option} for shopify_option in shopify_options],
-            }],
-            "metafields": [
-                {"namespace": "bsale", "key": "product_id", "type": "single_line_text_field", "value": str(bsale_product.get("id", ""))},
-                {"namespace": "bsale", "key": "office_id", "type": "single_line_text_field", "value": bsale_office_id},
-                {"namespace": "bsale", "key": "product_data", "type": "json", "value": json.dumps(bsale_product, ensure_ascii=False, separators=(",", ":"))[:60000]},
-                {"namespace": "bsale", "key": "variants_data", "type": "json", "value": json.dumps(bsale_variants, ensure_ascii=False, separators=(",", ":"))[:60000]},
-                {"namespace": "bsale", "key": "stock_data", "type": "json", "value": json.dumps({str(k): v for k, v in bsale_stocks.items()}, ensure_ascii=False, separators=(",", ":"))[:60000]},
-            ],
-        }
         shopify_create_mutation = """
         mutation CreateBsaleDraft($product: ProductCreateInput!) {
           productCreate(product: $product) {
@@ -115,13 +120,56 @@ class ShopifyAdmin:
             userErrors { field message }
           }
         }"""
+
+        shopify_product_input = {
+            "title": str(title[:255]),
+            "descriptionHtml": "<p>" + (description.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")) + "</p>" if description else "",
+            "vendor": "Bsale",
+            "status": "DRAFT",
+            "tags": ["bsale", f"bsale-product-{id}"],
+            "productOptions": [{
+                "name": "Bsale variant",
+                "values": [{"name": option} for option in options],
+            }],
+            "metafields": [
+                {"namespace": "bsale", "key": "product_id", "type": "single_line_text_field", "value": str(id)},
+                {"namespace": "bsale", "key": "office_id", "type": "single_line_text_field", "value": metafields["bsale_office_id"]},
+                # {"namespace": "bsale", "key": "product_data", "type": "json", "value": json.dumps(bsale_product, ensure_ascii=False, separators=(",", ":"))[:60000]},
+                # {"namespace": "bsale", "key": "variants_data", "type": "json", "value": json.dumps(bsale_variants, ensure_ascii=False, separators=(",", ":"))[:60000]},
+                # {"namespace": "bsale", "key": "stock_data", "type": "json", "value": json.dumps({str(k): v for k, v in bsale_stocks.items()}, ensure_ascii=False, separators=(",", ":"))[:60000]},
+            ],
+        }
+
+        logger.debug("shopify_product_input: ")
+        logger.debug(json.dumps(shopify_product_input,indent=4))
+
         shopify_create_response = self.graphql(shopify_create_mutation, {"product": shopify_product_input})["productCreate"]
         if shopify_create_response.get("userErrors"):
             raise RuntimeError(f"productCreate Fehler: {json.dumps(shopify_create_response['userErrors'], ensure_ascii=False)}")
         shopify_product = shopify_create_response.get("product")
         if not shopify_product:
             raise RuntimeError("Shopify hat kein Produkt zurückgegeben.")
-        shopify_initial_variant = shopify_product["variants"]["nodes"][0]
+
+        return shopify_product
+
+    def _create_variants(
+        self,
+        product,
+        bsale_variants,
+        bsale_prices,
+        shopify_options,
+        shopify_sync_inventory
+    ):
+        logger.debug("calling _create_variants()")
+        shopify_variant_mutation = """
+        mutation SetBsaleVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+          productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+            productVariants { id sku price inventoryItem { id tracked } }
+            userErrors { field message }
+          }
+        }"""
+
+        shopify_initial_variant = product["variants"]["nodes"][0]
 
         shopify_variant_inputs = []
         for bsale_index, bsale_variant in enumerate(bsale_variants):
@@ -149,17 +197,11 @@ class ShopifyAdmin:
                 }]
             shopify_variant_inputs.append(shopify_variant_input)
 
-        shopify_variant_mutation = """
-        mutation SetBsaleVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
-          productVariantsBulkUpdate(productId: $productId, variants: $variants) {
-            productVariants { id sku price inventoryItem { id tracked } }
-            userErrors { field message }
-          }
-        }"""
+        input = {"productId": product["id"], "variants": [shopify_variant_inputs[0]]}
         # Shopify bulkUpdate only updates existing variants; create any remaining variants separately.
-        shopify_first_variant_response = self.graphql(shopify_variant_mutation, {
-            "productId": shopify_product["id"], "variants": [shopify_variant_inputs[0]]
-        })["productVariantsBulkUpdate"]
+        logger.debug("shopify_variant_mutation: "+json.dumps(shopify_variant_mutation,indent = 4))
+        logger.debug("input: "+json.dumps(input,indent = 4))
+        shopify_first_variant_response = self.graphql(shopify_variant_mutation, input)["productVariantsBulkUpdate"]
         if shopify_first_variant_response.get("userErrors"):
             raise RuntimeError(f"Shopify Varianten-Fehler: {json.dumps(shopify_first_variant_response['userErrors'], ensure_ascii=False)}")
 
@@ -171,51 +213,108 @@ class ShopifyAdmin:
                 userErrors { field message }
               }
             }"""
-            shopify_create_variants_response = self.graphql(shopify_bulk_create_mutation, {
-                "productId": shopify_product["id"], "variants": shopify_variant_inputs[1:]
-            })["productVariantsBulkCreate"]
+
+            input = {"productId": product["id"], "variants": shopify_variant_inputs[1:]}
+            logger.debug("shopify_bulk_create_mutation: "+json.dumps(shopify_variant_mutation,indent = 4))
+            logger.debug("input: "+json.dumps(input,indent = 4))
+            shopify_create_variants_response = self.graphql(shopify_bulk_create_mutation, input)["productVariantsBulkCreate"]
             if shopify_create_variants_response.get("userErrors"):
                 raise RuntimeError(f"Shopify Varianten-Erstellung fehlgeschlagen: {json.dumps(shopify_create_variants_response['userErrors'], ensure_ascii=False)}")
             shopify_all_variant_results = shopify_first_variant_response.get("productVariants", []) + shopify_create_variants_response.get("productVariants", [])
         else:
             shopify_all_variant_results = shopify_first_variant_response.get("productVariants", [])
 
-        if shopify_sync_inventory:
-            if not SHOPIFY_LOCATION_ID:
-                raise RuntimeError("--sync-inventory erfordert SHOPIFY_LOCATION_ID.")
-            for bsale_variant, shopify_variant in zip(bsale_variants, shopify_all_variant_results):
-                bsale_stock = bsale_stocks.get(str(bsale_variant.get("id")))
-                if bsale_stock is None:
-                    logger.warning("Kein Stock für Bsale-Variante %s in Office %s; Bestand wird nicht gesetzt.", bsale_variant.get("id"), bsale_office_id)
-                    continue
-                shopify_inventory_item_id = (shopify_variant.get("inventoryItem") or {}).get("id")
-                if not shopify_inventory_item_id:
-                    continue
-                shopify_quantity = bsale_stock.get("quantityAvailable", bsale_stock.get("quantity"))
-                if shopify_quantity is None:
-                    continue
-                shopify_quantity = int(Decimal(str(shopify_quantity)))
-                shopify_inventory_mutation = """
-                mutation SetInventory($input: InventorySetQuantitiesInput!) {
-                  inventorySetQuantities(input: $input) {
-                    inventoryAdjustmentGroup { id }
-                    userErrors { field message }
-                  }
-                }"""
-                shopify_inventory_response = self.graphql(shopify_inventory_mutation, {
-                    "input": {
-                        "name": "available",
-                        "reason": "correction",
-                        "referenceDocumentUri": f"bsale://office/{bsale_office_id}/variant/{bsale_variant.get('id')}",
-                        "quantities": [{
-                            "inventoryItemId": shopify_inventory_item_id,
-                            "locationId": SHOPIFY_LOCATION_ID,
-                            "quantity": shopify_quantity,
-                        }],
+        return shopify_all_variant_results
+
+    def _sync_inventory(self,bsale_variants,shopify_all_variant_results,bsale_stocks):
+        for bsale_variant, shopify_variant in zip(bsale_variants, shopify_all_variant_results):
+            bsale_stock = bsale_stocks.get(str(bsale_variant.get("id")))
+            if bsale_stock is None:
+                logger.warning("Kein Stock für Bsale-Variante %s in Office %s; Bestand wird nicht gesetzt.", bsale_variant.get("id"), bsale_office_id)
+                continue
+            shopify_inventory_item_id = (shopify_variant.get("inventoryItem") or {}).get("id")
+            if not shopify_inventory_item_id:
+                continue
+            shopify_quantity = bsale_stock.get("quantityAvailable", bsale_stock.get("quantity"))
+            if shopify_quantity is None:
+                continue
+            shopify_quantity = int(Decimal(str(shopify_quantity)))
+
+            shopify_inventory_mutation = """
+            mutation inventorySetQuantities($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) {
+                inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) {
+                  inventoryAdjustmentGroup {
+                    reason
+                    referenceDocumentUri
+                    changes {
+                      name
+                      delta
+                      quantityAfterChange
                     }
-                })["inventorySetQuantities"]
-                if shopify_inventory_response.get("userErrors"):
-                    raise RuntimeError(f"Shopify Bestand konnte nicht gesetzt werden: {json.dumps(shopify_inventory_response['userErrors'], ensure_ascii=False)}")
+                  }
+                  userErrors {
+                    code
+                    field
+                    message
+                  }
+                }
+              }
+            """
+            input = {
+                "input": {
+                    "name": "available",
+                    "reason": "correction",
+                    "referenceDocumentUri": "logistics://some.warehouse/take/2026-02-23T13:14:15Z",
+                    "quantities": [
+                        {
+                            "inventoryItemId": shopify_inventory_item_id,
+                            "locationId": self._location_gid(),
+                            "quantity": shopify_quantity,
+                            "changeFromQuantity": 0
+                        }
+                    ]
+                },
+                "idempotencyKey": str(uuid.uuid4())
+            }
+            logger.debug("shopify_inventory_mutation: "+shopify_inventory_mutation)
+            logger.debug("input: "+json.dumps(input,indent=4))
+
+            shopify_inventory_response = self.graphql(shopify_inventory_mutation, input)["inventorySetQuantities"]
+            if shopify_inventory_response.get("userErrors"):
+                raise RuntimeError(f"Shopify Bestand konnte nicht gesetzt werden: {json.dumps(shopify_inventory_response['userErrors'], ensure_ascii=False)}")
+
+
+    def create_draft(
+        self,
+        bsale_product: dict[str, Any],
+        bsale_variants: list[dict[str, Any]],
+        bsale_prices: dict[str, str | None],
+        bsale_stocks: dict[str, dict[str, Any] | None],
+        bsale_office_id: str,
+        shopify_sync_inventory: bool,
+    ) -> dict[str, Any]:
+
+        if not bsale_variants:
+            raise ValueError("Produkt ohne Varianten kann nicht importiert werden.")
+        logger.info("Erstelle Shopify-Draft für Bsale-Produkt %s", bsale_product.get("id"))
+
+        title = as_text(bsale_product.get("name")) or as_text(bsale_product.get("description")) or f"Bsale Produkt {bsale_product.get('id')}"
+
+        description = as_text(bsale_product.get("description"))
+        shopify_options: list[str] = []
+        for bsale_variant in bsale_variants:
+            shopify_option = as_text(bsale_variant.get("description")) or as_text(bsale_variant.get("code")) or str(bsale_variant.get("id"))
+            if shopify_option in shopify_options:
+                shopify_option = f"{shopify_option} ({bsale_variant.get('id')})"
+            shopify_options.append(shopify_option[:255])
+            logger.debug("shopify_option: "+shopify_option[:255])
+
+        # create product + initially empty variant
+        shopify_product = self._create_product(title=title[:255], description=description, id=bsale_product.get('id'),options=shopify_options,metafields={"bsale_office_id": bsale_office_id})
+
+        shopify_all_variant_results = self._create_variants(shopify_product, bsale_variants, bsale_prices, shopify_options, shopify_sync_inventory)
+
+        if shopify_sync_inventory:
+            self._sync_inventory(bsale_variants,shopify_all_variant_results,bsale_stocks)
 
         return {"id": shopify_product["id"], "title": shopify_product["title"], "status": shopify_product["status"]}
-

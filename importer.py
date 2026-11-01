@@ -3,6 +3,7 @@ import argparse
 import csv
 import os
 import json
+import sys
 from typing import Any
 from config import BSALE_ACCESS_TOKEN
 from common import as_text, configure_logging, logger, log
@@ -100,6 +101,16 @@ def main() -> int:
             else:
                 if shopify_missing_price_ids:
                     bsale_prices = {k: (v if v is not None else "0.00") for k, v in bsale_prices.items()}
+
+                logger.debug("create_draft(")
+                logger.debug("  bsale_product="+str(bsale_product)+",")
+                logger.debug("  bsale_variants="+json.dumps(bsale_variants)+",")
+                logger.debug("  bsale_prices="+json.dumps(bsale_prices)+",")
+                logger.debug("  bsale_stocks="+json.dumps(bsale_stocks)+",")
+                logger.debug("  office_id="+str(args.office_id)+",")
+                logger.debug("  sync_inventory="+str(args.sync_inventory))
+                logger.debug(")")
+
                 shopify_create_result = shopify_admin.create_draft(
                     bsale_product, bsale_variants, bsale_prices, bsale_stocks, args.office_id, args.sync_inventory
                 )
@@ -116,6 +127,7 @@ def main() -> int:
             "variant_ids": ";".join(as_text(v.get("id")) for v in bsale_variants),
             "skus": ";".join(bsale_skus),
             "office_id": args.office_id,
+            "price": bsale_prices[bsale_variant_id] if bsale_prices[bsale_variant_id] is not None else "-1",
             "prices_missing": ";".join(shopify_missing_price_ids),
             "stock_missing": ";".join(shopify_missing_stock_ids),
             "status": shopify_status,
@@ -126,7 +138,7 @@ def main() -> int:
     import csv
     shopify_report_path = os.path.abspath(args.report)
     with open(shopify_report_path, "w", newline="", encoding="utf-8-sig") as shopify_report_file:
-        shopify_fieldnames = ["bsale_product_id", "title", "variant_ids", "skus", "office_id", "prices_missing", "stock_missing", "status", "shopify_product_id", "notes"]
+        shopify_fieldnames = ["bsale_product_id", "title", "variant_ids", "skus", "office_id", "price", "prices_missing", "stock_missing", "status", "shopify_product_id", "notes"]
         shopify_writer = csv.DictWriter(shopify_report_file, fieldnames=shopify_fieldnames, extrasaction="ignore")
         shopify_writer.writeheader()
         shopify_writer.writerows(shopify_report_rows)

@@ -3,8 +3,11 @@ import re
 from typing import Any
 from config import BSALE_API_BASE, HTTP
 from common import as_text, logger, money, relation_id
-import json,re
+import json,os
 from pathlib import Path
+from tenacity import retry, stop_after_delay, wait_exponential_jitter, retry_if_exception_type
+import requests
+
 
 class BsaleClient:
     def __init__(self, bsale_access_token: str, bsale_price_list_id: str = "", bsale_price_list_name: str = ""):
@@ -18,10 +21,21 @@ class BsaleClient:
         self.bsale_price_list_name = bsale_price_list_name.strip()
         self._resolved_price_list: dict[str, Any] | None = None
 
+    @retry(
+        stop=stop_after_delay(300),  # Stop after 5 minutes (300 seconds)
+        wait=wait_exponential_jitter(initial=1, max=60, jitter=2),  # Exponential backoff
+        retry=retry_if_exception_type((requests.exceptions.ConnectionError, requests.exceptions.RequestException, requests.exceptions.HTTPError)),
+        reraise=True
+    )
+
     def get(self, path_or_url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         bsale_url = path_or_url if path_or_url.startswith("http") else f"{BSALE_API_BASE}/{path_or_url.lstrip('/')}"
         logger.debug("Bsale API GET %s params=%s", bsale_url, params or {})
-        bsale_response = HTTP.get(bsale_url, headers=self.headers, params=params, timeout=45)
+        try:
+            bsale_response = HTTP.get(bsale_url, headers=self.headers, params=params, timeout=45)
+        except Exception as e:
+            logger.error("failed after attempting for 5 minutes: ", e)
+            raise e
         if bsale_response.status_code >= 400:
             raise RuntimeError(f"Bsale HTTP {bsale_response.status_code} für {bsale_url}: {bsale_response.text[:800]}")
         logger.debug("Bsale API Antwort: HTTP %s für %s", bsale_response.status_code, bsale_url)
@@ -30,7 +44,13 @@ class BsaleClient:
     def list_all(self, path: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
 
         # local caching
-        cachefile="cache/"+re.sub("/",".",path)
+        cachefile="cache/"+re.sub("/",".",path) # replace / with .
+        root, ext = os.path.splitext(cachefile) # split filename from extension
+        paramsstring=""
+        if params:
+            paramsstring=",".join(f"{k}:{v}" for k, v in params.items()) # generate string from params
+        cachefile = root+"."+paramsstring+"."+ext
+
         if Path(cachefile).is_file():
             logger.info("reading cache file "+cachefile)
             with open(cachefile, 'r') as file:
@@ -54,7 +74,6 @@ class BsaleClient:
         logger.debug("Bsale-Liste %s geladen: %s Datensätze", path, len(bsale_items))
 
         # local caching
-        cachefile = "cache/"+re.sub("/",".",path)
         if not Path(cachefile).is_file():
             logger.info("writing cache file "+cachefile)
             with open(cachefile, 'w') as file:
